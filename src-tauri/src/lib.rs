@@ -1,163 +1,206 @@
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{TrayIconBuilder},
-    Manager,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager, PhysicalPosition, WindowEvent,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use chrono::{Local, Datelike, Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockData {
-    id: String,
-    #[serde(rename = "startTime")]
-    start_time: String,
-    #[serde(rename = "endTime")]
-    end_time: String,
-    #[serde(rename = "isActive")]
-    is_active: bool,
-    #[serde(rename = "tokenCounts")]
-    token_counts: TokenCounts,
-    #[serde(rename = "costUSD")]
-    cost_usd: f64,
-    models: Vec<String>,
+struct DailyEntry {
+    period: String,
+    #[serde(rename = "totalCost")]
+    total_cost: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TokenCounts {
-    #[serde(rename = "inputTokens")]
-    input_tokens: u64,
-    #[serde(rename = "outputTokens")]
-    output_tokens: u64,
-    #[serde(rename = "cacheCreationInputTokens")]
-    cache_creation_input_tokens: u64,
-    #[serde(rename = "cacheReadInputTokens")]
-    cache_read_input_tokens: u64,
+struct DailyResponse {
+    daily: Vec<DailyEntry>,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlocksResponse {
-    blocks: Vec<BlockData>,
-}
-
 
 #[derive(Debug, Clone)]
-struct SessionData {
-    active_block: Option<BlockData>,
+struct AppData {
+    daily_entries: Vec<DailyEntry>,
     last_updated: Option<Instant>,
     ccusage_available: bool,
 }
 
-static SESSION_CACHE: Mutex<SessionData> = Mutex::new(SessionData {
-    active_block: None,
+static APP_CACHE: Mutex<AppData> = Mutex::new(AppData {
+    daily_entries: Vec::new(),
     last_updated: None,
     ccusage_available: false,
 });
 
-// Removed AppSettings as we now always show cost
-
 static IS_REFRESHING: AtomicBool = AtomicBool::new(false);
+// Unix-ms timestamp of the last time the popover was hidden due to losing focus.
+// Used so that clicking the tray icon to dismiss the window doesn't immediately reopen it.
+static LAST_HIDE_MS: AtomicU64 = AtomicU64::new(0);
 
-// Removed settings functions as we now always show cost
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
-fn format_model_name(model_name: &str) -> String {
-    match model_name {
-        "claude-opus-4-20250514" => "Opus 4".to_string(),
-        "claude-sonnet-4-20250514" => "Sonnet 4".to_string(),
-        "claude-3-5-sonnet-20241022" => "Sonnet 3.5".to_string(),
-        "claude-3-haiku-20240307" => "Haiku".to_string(),
-        _ => {
-            if model_name.contains("opus") {
-                "Opus".to_string()
-            } else if model_name.contains("sonnet") {
-                "Sonnet".to_string()
-            } else if model_name.contains("haiku") {
-                "Haiku".to_string()
-            } else {
-                model_name.to_string()
-            }
-        }
+// ---------------------------------------------------------------------------
+// Stats payload sent to the webview
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct DayStat {
+    name: String,
+    cost: f64,
+    #[serde(rename = "isToday")]
+    is_today: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatsPayload {
+    available: bool,
+    #[serde(rename = "hasData")]
+    has_data: bool,
+    #[serde(rename = "monthTotal")]
+    month_total: f64,
+    today: f64,
+    #[serde(rename = "weekTotal")]
+    week_total: f64,
+    days: Vec<DayStat>,
+}
+
+fn compute_stats() -> StatsPayload {
+    let cache = APP_CACHE.lock().unwrap();
+    let available = cache.ccusage_available;
+    let has_data = cache.last_updated.is_some();
+
+    let today = Local::now().date_naive();
+    let today_str = today.format("%Y-%m-%d").to_string();
+    let month_prefix = today.format("%Y-%m").to_string();
+
+    let cost_map: HashMap<String, f64> = cache.daily_entries.iter()
+        .map(|e| (e.period.clone(), e.total_cost))
+        .collect();
+
+    let month_total: f64 = cache.daily_entries.iter()
+        .filter(|e| e.period.starts_with(&month_prefix))
+        .map(|e| e.total_cost)
+        .sum();
+
+    let today_cost = cost_map.get(&today_str).copied().unwrap_or(0.0);
+
+    let days_from_monday = today.weekday().num_days_from_monday() as i64;
+    let week_start = today - Duration::days(days_from_monday);
+
+    let day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+    let mut days = Vec::with_capacity(7);
+    let mut week_total = 0.0;
+    for i in 0i64..7 {
+        let d = week_start + Duration::days(i);
+        let ds = d.format("%Y-%m-%d").to_string();
+        let cost = cost_map.get(&ds).copied().unwrap_or(0.0);
+        week_total += cost;
+        days.push(DayStat {
+            name: day_names[i as usize].to_string(),
+            cost,
+            is_today: ds == today_str,
+        });
+    }
+
+    StatsPayload {
+        available,
+        has_data,
+        month_total,
+        today: today_cost,
+        week_total,
+        days,
     }
 }
 
-async fn fetch_session_data() -> (Option<BlockData>, bool) {
-    // Try multiple approaches to find and run ccusage
+// ---------------------------------------------------------------------------
+// Tauri commands invoked from the webview
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn get_stats() -> StatsPayload {
+    compute_stats()
+}
+
+#[tauri::command]
+async fn refresh_now(app: tauri::AppHandle) {
+    refresh_data(&app).await;
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+async fn debug_info() -> String {
+    get_debug_info().await
+}
+
+// ---------------------------------------------------------------------------
+// ccusage integration
+// ---------------------------------------------------------------------------
+
+async fn fetch_daily_data() -> (Vec<DailyEntry>, bool) {
     let shell_commands = vec![
-        // Most likely to succeed: Try with explicit PATH that includes common npm locations
-        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH npx ccusage@latest blocks --json --active"]),
-        // Try with explicit PATH for global ccusage
-        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH ccusage blocks --json --active"]),
-        // Use shell to ensure proper PATH resolution (may work in dev environments)
-        ("sh", vec!["-c", "npx ccusage@latest blocks --json --active"]),
-        // Try global ccusage if installed
-        ("sh", vec!["-c", "ccusage blocks --json --active"]),
-        // Try direct npx if in PATH
-        ("npx", vec!["ccusage@latest", "blocks", "--json", "--active"]),
-        // Try direct ccusage command
-        ("ccusage", vec!["blocks", "--json", "--active"]),
+        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH npx ccusage@latest daily --json"]),
+        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH ccusage daily --json"]),
+        ("sh", vec!["-c", "npx ccusage@latest daily --json"]),
+        ("sh", vec!["-c", "ccusage daily --json"]),
+        ("npx", vec!["ccusage@latest", "daily", "--json"]),
+        ("ccusage", vec!["daily", "--json"]),
     ];
 
     for (cmd, args) in shell_commands {
-        let output = Command::new(cmd)
-            .args(&args)
-            .output()
-            .await;
-
+        let output = Command::new(cmd).args(&args).output().await;
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
-                // Try to parse the response
-                match serde_json::from_str::<BlocksResponse>(&stdout) {
-                    Ok(response) => {
-                        // ccusage is working! Return the active block (if any) and true
-                        let active_block = response.blocks.into_iter().find(|block| block.is_active);
-                        return (active_block, true);
-                    }
+                match serde_json::from_str::<DailyResponse>(&stdout) {
+                    Ok(response) => return (response.daily, true),
                     Err(e) => {
-                        eprintln!("Failed to parse ccusage response: {}", e);
-                        eprintln!("Response was: {}", stdout);
+                        eprintln!("Failed to parse ccusage daily response: {}", e);
                         continue;
                     }
                 }
             }
             Ok(output) => {
-                eprintln!("ccusage command failed with status: {}", output.status);
-                eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+                eprintln!("ccusage daily command failed: {}", output.status);
                 continue;
             }
             Err(e) => {
-                eprintln!("Failed to execute command '{}': {}", cmd, e);
+                eprintln!("Failed to execute '{}': {}", cmd, e);
                 continue;
             }
         }
     }
 
-    eprintln!("All attempts to fetch session data failed");
-    (None, false)
+    eprintln!("All attempts to fetch daily data failed");
+    (Vec::new(), false)
 }
-
-// Removed fetch_blocks_data and fetch_week_data functions as they are no longer needed
 
 async fn get_debug_info() -> String {
     let mut debug_info = String::new();
-    
-    // Get PATH environment variable
+
     debug_info.push_str("Environment:\n");
     if let Ok(path) = std::env::var("PATH") {
         debug_info.push_str(&format!("Default PATH: {}\n", path));
     } else {
         debug_info.push_str("Default PATH: (not set)\n");
     }
-    
-    // Define extended PATH that we actually use
+
     let extended_path = "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH";
     debug_info.push_str(&format!("Extended PATH used: {}\n\n", extended_path));
-    
-    // Test commands with extended PATH
+
     debug_info.push_str("Command availability (with extended PATH):\n");
-    
+
     let commands_to_test = vec![
         (format!("{} which npx", extended_path), "npx location"),
         (format!("{} which node", extended_path), "node location"),
@@ -166,13 +209,9 @@ async fn get_debug_info() -> String {
         (format!("{} node --version", extended_path), "node version"),
         (format!("{} ccusage --version 2>&1 || echo 'not found'", extended_path), "ccusage version"),
     ];
-    
+
     for (cmd, desc) in commands_to_test {
-        let output = Command::new("sh")
-            .args(&["-c", &cmd])
-            .output()
-            .await;
-            
+        let output = Command::new("sh").args(&["-c", &cmd]).output().await;
         match output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -191,310 +230,192 @@ async fn get_debug_info() -> String {
             }
         }
     }
-    
-    // Test ccusage with extended PATH
-    debug_info.push_str("\nTesting ccusage:\n");
-    let ccusage_output = Command::new("sh")
-        .args(&["-c", &format!("{} npx ccusage@latest --version", extended_path)])
-        .output()
-        .await;
-        
-    match ccusage_output {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                debug_info.push_str(&format!("ccusage version: {}\n", stdout.trim()));
-            } else {
-                debug_info.push_str("ccusage: not available (npx ccusage@latest failed)\n");
-                if !output.stderr.is_empty() {
-                    debug_info.push_str(&format!("Error: {}\n", String::from_utf8_lossy(&output.stderr).trim()));
-                }
-            }
-        }
-        Err(e) => {
-            debug_info.push_str(&format!("Error executing ccusage: {}\n", e));
-        }
-    }
-    
+
     debug_info
 }
 
-async fn refresh_session_data(app_handle: &tauri::AppHandle) {
-    // Set refresh flag
+async fn refresh_data(app_handle: &tauri::AppHandle) {
     IS_REFRESHING.store(true, Ordering::Relaxed);
-    
-    // Fetch active session data
-    let (active_block, ccusage_available) = fetch_session_data().await;
-    
-    // Update tray title with cost if there's an active session
-    let title = if let Some(ref block) = active_block {
-        format!("${:.2}", block.cost_usd)
+
+    let (daily_entries, ccusage_available) = fetch_daily_data().await;
+
+    let today_str = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let today_cost = daily_entries.iter()
+        .find(|e| e.period == today_str)
+        .map(|e| e.total_cost)
+        .unwrap_or(0.0);
+
+    let title = if today_cost > 0.0 {
+        format!("${:.2}", today_cost)
     } else {
         String::new()
     };
-    
-    // Update cache
+
     {
-        let mut cache = SESSION_CACHE.lock().unwrap();
-        cache.active_block = active_block;
+        let mut cache = APP_CACHE.lock().unwrap();
+        cache.daily_entries = daily_entries;
         cache.last_updated = Some(Instant::now());
         cache.ccusage_available = ccusage_available;
     }
-    
-    // Update tray title
+
     if let Some(tray) = app_handle.tray_by_id("main") {
         let _ = tray.set_title(Some(title));
     }
-    
-    // Rebuild and update the menu to reflect new data
-    if let Ok(new_menu) = build_menu(app_handle).await {
-        if let Some(tray) = app_handle.try_state::<Arc<tauri::tray::TrayIcon>>() {
-            let _ = tray.set_menu(Some(new_menu));
-        }
-    }
-    
-    // Clear refresh flag
+
+    // Notify the webview that fresh data is available.
+    let _ = app_handle.emit("stats-updated", ());
+
     IS_REFRESHING.store(false, Ordering::Relaxed);
 }
 
-async fn build_menu(app: &tauri::AppHandle) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
-    let mut menu_builder = MenuBuilder::new(app);
+// ---------------------------------------------------------------------------
+// Tray menu (right-click) — actions only; stats live in the popover window
+// ---------------------------------------------------------------------------
 
-    // CCUsage header (simple, no timestamp)
-    let ccusage_header = MenuItemBuilder::with_id("ccusage_header", "CCUsage")
-        .build(app)?;
-    menu_builder = menu_builder.item(&ccusage_header).separator();
-
-    // Get data from cache
-    let (active_block, has_attempted_fetch, ccusage_available) = {
-        let cache = SESSION_CACHE.lock().unwrap();
-        (cache.active_block.clone(), cache.last_updated.is_some(), cache.ccusage_available)
-    };
-
-    // Current session section
-    let session_title = MenuItemBuilder::with_id("session_title", "Current session")
-        .enabled(false)
-        .build(app)?;
-    menu_builder = menu_builder.item(&session_title);
-
-    if let Some(block) = active_block {
-        // Cost and token counts
-        let input_k = block.token_counts.input_tokens as f64 / 1000.0;
-        let output_k = block.token_counts.output_tokens as f64 / 1000.0;
-        let cost_str = format!("Cost: ${:.2}", block.cost_usd);
-        let tokens_str = format!("Tokens: In {:.1}K / Out {:.1}K", input_k, output_k);
-        
-        let cost_item = MenuItemBuilder::with_id("session_cost", &cost_str)
-            .build(app)?;
-        let tokens_item = MenuItemBuilder::with_id("session_tokens", &tokens_str)
-            .build(app)?;
-        menu_builder = menu_builder.item(&cost_item).item(&tokens_item);
-        
-        // Session times
-        let start_time = chrono::DateTime::parse_from_rfc3339(&block.start_time)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Local).format("%I:%M %p").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-            
-        let end_time = chrono::DateTime::parse_from_rfc3339(&block.end_time)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Local).format("%I:%M %p").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
-            
-        let session_start_item = MenuItemBuilder::with_id("session_start", &format!("Started: {}", start_time))
-            .build(app)?;
-        let session_end_item = MenuItemBuilder::with_id("session_end", &format!("Expires: {}", end_time))
-            .build(app)?;
-        menu_builder = menu_builder.item(&session_start_item).item(&session_end_item);
-        
-        // Models used
-        if !block.models.is_empty() {
-            menu_builder = menu_builder.separator();
-            let models_header = MenuItemBuilder::with_id("models_header", "Models used")
-                .enabled(false)
-                .build(app)?;
-            menu_builder = menu_builder.item(&models_header);
-            
-            for model in &block.models {
-                let model_name = format_model_name(model);
-                let model_item = MenuItemBuilder::with_id(
-                    &format!("model_{}", model),
-                    &model_name,
-                )
-                .build(app)?;
-                menu_builder = menu_builder.item(&model_item);
-            }
-        }
-        
-        menu_builder = menu_builder.separator();
-    } else if has_attempted_fetch {
-        // We've tried to fetch
-        let no_session = MenuItemBuilder::with_id("no_session", "No active session")
-            .build(app)?;
-        menu_builder = menu_builder.item(&no_session);
-        
-        // Only show error if ccusage is actually not available
-        if !ccusage_available {
-            // Add helpful error message
-            let error_msg = MenuItemBuilder::with_id("error_msg", "ccusage may not be installed")
-                .enabled(false)
-                .build(app)?;
-            menu_builder = menu_builder.item(&error_msg);
-            
-            let install_msg = MenuItemBuilder::with_id("install_msg", "Install: npm install -g ccusage")
-                .build(app)?;
-            menu_builder = menu_builder.item(&install_msg);
-        }
-        
-        menu_builder = menu_builder.separator();
-    } else {
-        // Still loading
-        let loading = MenuItemBuilder::with_id("loading", "Loading...")
-            .enabled(false)
-            .build(app)?;
-        menu_builder = menu_builder.item(&loading).separator();
-    }
-
-
-    // Refresh button
-    let refresh = MenuItemBuilder::with_id("refresh", "Refresh")
-        .build(app)?;
-    menu_builder = menu_builder.item(&refresh);
-
-    // Debug info (useful for troubleshooting)
-    let debug = MenuItemBuilder::with_id("debug", "Debug Info")
-        .build(app)?;
-    menu_builder = menu_builder.item(&debug).separator();
-
-    // Quit
+fn build_action_menu(app: &tauri::AppHandle) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    let refresh = MenuItemBuilder::with_id("refresh", "Refresh").build(app)?;
+    let debug = MenuItemBuilder::with_id("debug", "Debug Info").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit")
         .accelerator("Cmd+Q")
         .build(app)?;
-    menu_builder = menu_builder.item(&quit);
 
-    Ok(menu_builder.build()?)
+    let menu = MenuBuilder::new(app)
+        .item(&refresh)
+        .item(&debug)
+        .separator()
+        .item(&quit)
+        .build()?;
+    Ok(menu)
 }
 
+/// Show the popover positioned just below the tray icon, or hide it if already visible.
+fn toggle_popover(app: &tauri::AppHandle, rect: tauri::Rect) {
+    let Some(win) = app.get_webview_window("main") else { return };
+
+    if win.is_visible().unwrap_or(false) {
+        let _ = win.hide();
+        return;
+    }
+
+    // Avoid reopening immediately after a focus-loss hide triggered by this same click.
+    if now_ms().saturating_sub(LAST_HIDE_MS.load(Ordering::Relaxed)) < 250 {
+        return;
+    }
+
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let pos = rect.position.to_physical::<f64>(scale);
+    let size = rect.size.to_physical::<f64>(scale);
+    let win_size = win.outer_size().map(|s| (s.width as f64, s.height as f64)).unwrap_or((280.0, 430.0));
+
+    let x = pos.x + size.width / 2.0 - win_size.0 / 2.0;
+    let y = pos.y + size.height;
+
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+    let _ = win.show();
+    let _ = win.set_focus();
+    // Make sure the webview has the latest numbers when it appears.
+    let _ = app.emit("stats-updated", ());
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![get_stats, refresh_now, quit_app, debug_info])
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let app_handle = app.handle().clone();
-            
-            // Start periodic refresh task
+
+            // Hide the popover when it loses focus (e.g. clicking elsewhere).
+            if let Some(win) = app.get_webview_window("main") {
+                let win_for_event = win.clone();
+                win.on_window_event(move |event| {
+                    if let WindowEvent::Focused(false) = event {
+                        LAST_HIDE_MS.store(now_ms(), Ordering::Relaxed);
+                        let _ = win_for_event.hide();
+                    }
+                });
+            }
+
+            // Periodic refresh every 2 minutes.
             let periodic_handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(120)); // 2 minutes
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(120));
                 loop {
                     interval.tick().await;
-                    // Only refresh if not already refreshing and we have initial data
                     if !IS_REFRESHING.load(Ordering::Relaxed) {
                         let should_refresh = {
-                            let cache = SESSION_CACHE.lock().unwrap();
-                            cache.last_updated.is_some() // Only auto-refresh if we've refreshed at least once
+                            let cache = APP_CACHE.lock().unwrap();
+                            cache.last_updated.is_some()
                         };
                         if should_refresh {
-                            refresh_session_data(&periodic_handle).await;
+                            refresh_data(&periodic_handle).await;
                         }
                     }
                 }
             });
 
-            tauri::async_runtime::spawn(async move {
-                // Initial data refresh on app startup
-                refresh_session_data(&app_handle).await;
-                
-                match build_menu(&app_handle).await {
-                    Ok(menu) => {
-                        // Get initial title from cache
-                        let initial_title = {
-                            let cache = SESSION_CACHE.lock().unwrap();
-                            cache.active_block.as_ref()
-                                .map(|block| format!("${:.2}", block.cost_usd))
-                        };
-                        
-                        let tray = TrayIconBuilder::with_id("main")
-                            .icon(
-                                tauri::image::Image::from_bytes(include_bytes!("../icons/bars.png"))
-                                    .unwrap()
-                                    .to_owned(),
-                            )
-                            .icon_as_template(true)
-                            .title(initial_title.unwrap_or_default())
-                            .menu(&menu)
-                            .show_menu_on_left_click(true)
-                            .on_menu_event({
-                                let _app_handle = app_handle.clone();
-                                move |app, event| match event.id().as_ref() {
-                                    "ccusage_header" => {
-                                        let _ = tauri_plugin_opener::open_url(
-                                            "https://github.com/ryoppippi/ccusage",
-                                            None::<String>,
-                                        );
-                                    }
-                                    "install_msg" => {
-                                        let _ = tauri_plugin_opener::open_url(
-                                            "https://github.com/ryoppippi/ccusage#installation",
-                                            None::<String>,
-                                        );
-                                    }
-                                    "quit" => {
-                                        app.exit(0);
-                                    }
-                                    "refresh" => {
-                                        let app_handle = app.app_handle().clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            // Force refresh all data
-                                            refresh_session_data(&app_handle).await;
-                                            
-                                            // Rebuild menu with fresh data
-                                            if let Ok(new_menu) = build_menu(&app_handle).await {
-                                                if let Some(tray) = app_handle.try_state::<Arc<tauri::tray::TrayIcon>>() {
-                                                    let _ = tray.set_menu(Some(new_menu));
-                                                }
-                                            }
-                                        });
-                                    }
-                                    "debug" => {
-                                        tauri::async_runtime::spawn(async move {
-                                            let debug_info = get_debug_info().await;
-                                            println!("=== DEBUG INFO ===\n{}\n==================", debug_info);
-                                            
-                                            // Also try to show in a dialog if possible
-                                            #[cfg(target_os = "macos")]
-                                            {
-                                                use std::process::Command as StdCommand;
-                                                let _ = StdCommand::new("osascript")
-                                                    .args(&[
-                                                        "-e",
-                                                        &format!(
-                                                            r#"display dialog "{}" buttons {{"OK"}} default button "OK" with title "CCUsage Debug Info""#,
-                                                            debug_info.replace("\"", "\\\"").replace("\n", "\\n")
-                                                        ),
-                                                    ])
-                                                    .spawn();
-                                            }
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            })
-                            .build(&app_handle)
-                            .unwrap();
+            // Build tray + initial data.
+            let menu = build_action_menu(&app_handle)?;
+            let tray = TrayIconBuilder::with_id("main")
+                .icon(
+                    tauri::image::Image::from_bytes(include_bytes!("../icons/bars.png"))
+                        .unwrap()
+                        .to_owned(),
+                )
+                .icon_as_template(true)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "quit" => app.exit(0),
+                    "refresh" => {
+                        let app_handle = app.app_handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            refresh_data(&app_handle).await;
+                        });
+                    }
+                    "debug" => {
+                        tauri::async_runtime::spawn(async move {
+                            let info = get_debug_info().await;
+                            println!("=== DEBUG INFO ===\n{}\n==================", info);
+                            #[cfg(target_os = "macos")]
+                            {
+                                use std::process::Command as StdCommand;
+                                let _ = StdCommand::new("osascript")
+                                    .args(&[
+                                        "-e",
+                                        &format!(
+                                            r#"display dialog "{}" buttons {{"OK"}} default button "OK" with title "CCUsage Debug Info""#,
+                                            info.replace("\"", "\\\"").replace("\n", "\\n")
+                                        ),
+                                    ])
+                                    .spawn();
+                            }
+                        });
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event
+                    {
+                        toggle_popover(tray.app_handle(), rect);
+                    }
+                })
+                .build(&app_handle)?;
 
-                        // Store tray reference in app state
-                        app_handle.manage(Arc::new(tray));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to build initial menu: {}", e);
-                    }
-                }
+            app_handle.manage(Arc::new(tray));
+
+            // Initial data refresh on startup.
+            let startup_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                refresh_data(&startup_handle).await;
             });
 
             Ok(())

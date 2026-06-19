@@ -1,6 +1,6 @@
 [package]
-name = "ccusage-macos-menubar"
-version = "0.1.0"
+name = "ccusage-menubar"
+version = "0.5.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

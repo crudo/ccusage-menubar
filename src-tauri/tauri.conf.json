@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ccusage-macos-menubar",
-  "version": "0.1.0",
-  "identifier": "com.ccusage-macos-menubar.app",
+  "productName": "ccusage-menubar",
+  "version": "0.5.0",
+  "identifier": "com.ccusage-menubar.app",
   "build": {
     "beforeDevCommand": "yarn dev",
     "devUrl": "http://localhost:1420",
@@ -10,7 +10,22 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [],
+    "windows": [
+      {
+        "label": "main",
+        "url": "/",
+        "width": 280,
+        "height": 430,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "shadow": true,
+        "focus": true
+      }
+    ],
     "security": {
       "csp": null
     },
