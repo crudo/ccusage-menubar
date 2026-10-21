@@ -150,8 +150,8 @@ async fn debug_info() -> String {
 
 async fn fetch_daily_data() -> (Vec<DailyEntry>, bool) {
     let shell_commands = vec![
-        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH npx ccusage@latest daily --json"]),
-        ("sh", vec!["-c", "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH ccusage daily --json"]),
+        ("sh", vec!["-c", "PATH=\"$(printf '%s:' /usr/local/bin /opt/homebrew/bin /usr/bin /bin $HOME/.npm/bin $HOME/.nvm/versions/node/*/bin $HOME/.volta/bin)$PATH\" npx ccusage@latest daily --json"]),
+        ("sh", vec!["-c", "PATH=\"$(printf '%s:' /usr/local/bin /opt/homebrew/bin /usr/bin /bin $HOME/.npm/bin $HOME/.nvm/versions/node/*/bin $HOME/.volta/bin)$PATH\" ccusage daily --json"]),
         ("sh", vec!["-c", "npx ccusage@latest daily --json"]),
         ("sh", vec!["-c", "ccusage daily --json"]),
         ("npx", vec!["ccusage@latest", "daily", "--json"]),
@@ -196,7 +196,7 @@ async fn get_debug_info() -> String {
         debug_info.push_str("Default PATH: (not set)\n");
     }
 
-    let extended_path = "PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$HOME/.npm/bin:$HOME/.nvm/versions/node/*/bin:$HOME/.volta/bin:$PATH";
+    let extended_path = "PATH=\"$(printf '%s:' /usr/local/bin /opt/homebrew/bin /usr/bin /bin $HOME/.npm/bin $HOME/.nvm/versions/node/*/bin $HOME/.volta/bin)$PATH\"";
     debug_info.push_str(&format!("Extended PATH used: {}\n\n", extended_path));
 
     debug_info.push_str("Command availability (with extended PATH):\n");
